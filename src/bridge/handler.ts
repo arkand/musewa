@@ -59,6 +59,12 @@ export function createHandler(deps: HandlerDeps) {
       return;
     }
 
+    // Text only in v1. Drop any message that carries media, even when it has a
+    // caption, so an image or document is never silently answered as text.
+    if (inbound.media) {
+      return;
+    }
+
     if (deduper.has(inbound.messageId)) {
       return;
     }
@@ -115,12 +121,11 @@ export function createHandler(deps: HandlerDeps) {
         ? `[sender: ${senderLabel(inbound.senderJid)}] ${stripWhatsAppBotMention(text)}`
         : text;
       const userContent = truncateUtf8(content, MAX_INPUT_BYTES);
+      const userTurn: ChatMessage = { content: userContent, role: "user" };
 
-      await deps.history.append(conversationKey, {
-        content: userContent,
-        role: "user",
-      });
-
+      // Build the request from existing history plus the pending user turn.
+      // The user turn is only persisted after a successful reply, so a message
+      // that makes Muse fail is not replayed on every later turn.
       const messages: MuseMessage[] = [
         ...(deps.config.museSystemPrompt
           ? [
@@ -131,10 +136,12 @@ export function createHandler(deps: HandlerDeps) {
             ]
           : []),
         ...deps.history.get(conversationKey),
+        userTurn,
       ];
 
       const reply = await concurrency.run(() => deps.muse.chat(messages));
 
+      await deps.history.append(conversationKey, userTurn);
       await deps.history.append(conversationKey, {
         content: reply,
         role: "assistant",

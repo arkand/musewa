@@ -189,6 +189,44 @@ describe("createHandler", () => {
     ]);
   });
 
+  test("does not persist the user turn when Muse fails", async () => {
+    const historyByKey = new Map<string, ChatMessage[]>();
+    const { deps } = createDeps();
+    deps.history = {
+      append: async (key: string, message: ChatMessage) => {
+        historyByKey.set(key, [...(historyByKey.get(key) ?? []), message]);
+      },
+      get: (key: string) => historyByKey.get(key) ?? [],
+    };
+    deps.muse.chat = async () => {
+      throw new Error("down");
+    };
+    const handler = createHandler(deps);
+
+    await handler(inbound());
+
+    expect(historyByKey.get("6281234567890@s.whatsapp.net") ?? []).toEqual([]);
+  });
+
+  test("persists the user turn and reply after a successful call", async () => {
+    const historyByKey = new Map<string, ChatMessage[]>();
+    const { deps } = createDeps("hi back");
+    deps.history = {
+      append: async (key: string, message: ChatMessage) => {
+        historyByKey.set(key, [...(historyByKey.get(key) ?? []), message]);
+      },
+      get: (key: string) => historyByKey.get(key) ?? [],
+    };
+    const handler = createHandler(deps);
+
+    await handler(inbound());
+
+    expect(historyByKey.get("6281234567890@s.whatsapp.net")).toEqual([
+      { content: "hello", role: "user" },
+      { content: "hi back", role: "assistant" },
+    ]);
+  });
+
   test("ignores own messages and empty text", async () => {
     const { deps, messages } = createDeps();
     const handler = createHandler(deps);
@@ -197,6 +235,21 @@ describe("createHandler", () => {
     await handler(inbound({ text: "   " }));
 
     expect(messages).toHaveLength(0);
+  });
+
+  test("ignores media even when it carries a caption", async () => {
+    const { deps, messages, sent } = createDeps();
+    const handler = createHandler(deps);
+
+    await handler(
+      inbound({
+        media: { kind: "image", message: {} },
+        text: "look at this",
+      })
+    );
+
+    expect(messages).toHaveLength(0);
+    expect(sent).toHaveLength(0);
   });
 
   test("deduplicates a repeated message id", async () => {

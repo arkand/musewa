@@ -4135,7 +4135,10 @@ bun test
 sudo useradd --system --home /var/lib/muse-whatsapp --shell /usr/sbin/nologin muse-whatsapp
 sudo install -d -o muse-whatsapp -g muse-whatsapp -m 0700 /var/lib/muse-whatsapp
 sudo install -d -o muse-whatsapp -g muse-whatsapp /opt/muse-whatsapp
-sudo cp -r dist package.json node_modules /opt/muse-whatsapp/
+sudo cp -r dist package.json bun.lock /opt/muse-whatsapp/
+sudo chown -R muse-whatsapp:muse-whatsapp /opt/muse-whatsapp
+# Install production deps on the VM; do not copy node_modules from the build host.
+sudo -u muse-whatsapp bash -c 'cd /opt/muse-whatsapp && bun install --production --frozen-lockfile'
 sudo install -m 0600 /dev/null /etc/muse-whatsapp.env
 sudo cp deploy/muse-whatsapp.service /etc/systemd/system/
 sudo systemctl daemon-reload

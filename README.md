@@ -24,7 +24,11 @@ bun test
 sudo useradd --system --home /var/lib/muse-whatsapp --shell /usr/sbin/nologin muse-whatsapp
 sudo install -d -o muse-whatsapp -g muse-whatsapp -m 0700 /var/lib/muse-whatsapp
 sudo install -d -o muse-whatsapp -g muse-whatsapp /opt/muse-whatsapp
-sudo cp -r dist package.json node_modules /opt/muse-whatsapp/
+sudo cp -r dist package.json bun.lock /opt/muse-whatsapp/
+sudo chown -R muse-whatsapp:muse-whatsapp /opt/muse-whatsapp
+# Install production dependencies on the VM so native-ish packages such as
+# Baileys match the VM architecture. Do not copy node_modules from the build host.
+sudo -u muse-whatsapp bash -c 'cd /opt/muse-whatsapp && bun install --production --frozen-lockfile'
 sudo install -m 0600 /dev/null /etc/muse-whatsapp.env
 sudo cp deploy/muse-whatsapp.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -61,3 +65,6 @@ journalctl -u muse-whatsapp -f
 - Baileys is unofficial. Keep message volume low and use a number you can lose.
 - A `loggedOut` disconnect needs a new pairing.
 - Group history is shared by all members.
+- Text only. Media messages are ignored, even when they carry a caption.
+- One reply runs per conversation at a time. If a second message arrives in the
+  same chat while a reply is still being generated, it is dropped, not queued.

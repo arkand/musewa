@@ -272,15 +272,20 @@ bun build src/cli/pair.ts --outdir dist --target bun --external @whiskeysockets/
 bun build src/cli/allow.ts --outdir dist --target bun --external @whiskeysockets/baileys
 ```
 
-`@whiskeysockets/baileys` stays external, so the deployed directory needs
-`node_modules`.
+`@whiskeysockets/baileys` stays external, so the deployed directory needs its
+own `node_modules`. Install production dependencies on the VM rather than
+copying `node_modules` from the build host, because Baileys pulls packages whose
+install output can be architecture-specific. Copy `bun.lock` and use
+`--frozen-lockfile` so the VM resolves the exact pinned versions.
 
 ```sh
 bun install
 bun run build
 sudo install -d -o muse-whatsapp -g muse-whatsapp -m 0700 /var/lib/muse-whatsapp
 sudo install -d -o muse-whatsapp -g muse-whatsapp /opt/muse-whatsapp
-sudo cp -r dist package.json node_modules /opt/muse-whatsapp/
+sudo cp -r dist package.json bun.lock /opt/muse-whatsapp/
+sudo chown -R muse-whatsapp:muse-whatsapp /opt/muse-whatsapp
+sudo -u muse-whatsapp bash -c 'cd /opt/muse-whatsapp && bun install --production --frozen-lockfile'
 sudo cp deploy/muse-whatsapp.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now muse-whatsapp
