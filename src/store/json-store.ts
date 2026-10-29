@@ -35,10 +35,7 @@ export async function writeJsonFile(
   value: unknown
 ): Promise<void> {
   const directory = dirname(path);
-  const temporaryPath = join(
-    directory,
-    `.${process.pid}.${randomUUID()}.tmp`
-  );
+  const temporaryPath = join(directory, `.${process.pid}.${randomUUID()}.tmp`);
 
   await mkdir(directory, { mode: 0o700, recursive: true });
   await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {

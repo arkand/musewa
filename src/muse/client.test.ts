@@ -33,9 +33,9 @@ describe("MuseClient", () => {
     const call0 = calls[0];
     expect(call0?.url).toBe("http://muse.local/v1/chat/completions");
     expect(call0?.init.method).toBe("POST");
-    expect(
-      (call0?.init.headers as Record<string, string>)?.authorization
-    ).toBe("Bearer secret");
+    expect((call0?.init.headers as Record<string, string>)?.authorization).toBe(
+      "Bearer secret"
+    );
     expect(JSON.parse(String(call0?.init.body))).toEqual({
       messages: [{ content: "hello", role: "user" }],
       model: "muse-1",

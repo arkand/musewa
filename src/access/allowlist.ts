@@ -95,10 +95,7 @@ export function isGroupSenderAllowed(
   return senderJids.some((jid) => members.has(normalizeJid(jid)));
 }
 
-export function addDm(
-  allowlist: AllowlistFile,
-  entry: string
-): AllowlistFile {
+export function addDm(allowlist: AllowlistFile, entry: string): AllowlistFile {
   return {
     ...allowlist,
     dm: uniqueSorted([...allowlist.dm, normalizeAllowEntry(entry)]),
@@ -183,9 +180,7 @@ export function removeGroupMember(
       ...allowlist.groups,
       [jid]: {
         ...policy,
-        members: policy.members.filter(
-          (item) => normalizeJid(item) !== member
-        ),
+        members: policy.members.filter((item) => normalizeJid(item) !== member),
       },
     },
   };
@@ -231,7 +226,10 @@ export class AllowlistStore {
       this.current = loaded ?? { dm: [], groups: {} };
       this.mtimeMs = mtime;
     } catch (error) {
-      console.error("Allowlist reload failed; keeping the last good copy.", error);
+      console.error(
+        "Allowlist reload failed; keeping the last good copy.",
+        error
+      );
       this.mtimeMs = mtime;
     }
 

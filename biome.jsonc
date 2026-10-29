@@ -12,6 +12,7 @@
         "useOptionalChain": "off"
       },
       "performance": {
+        "noAwaitInLoops": "off",
         "useTopLevelRegex": "off"
       },
       "style": {
@@ -27,10 +28,13 @@
         "useConsistentMethodSignatures": "off",
         "useConsistentTypeDefinitions": "off",
         "useDefaultParameterLast": "off",
-        "useDefaultSwitchClause": "off"
+        "useDefaultSwitchClause": "off",
+        "useDestructuring": "off",
+        "useErrorCause": "off"
       },
       "suspicious": {
         "noExplicitAny": "off",
+        "noUnnecessaryConditions": "off",
         "useAwait": "off"
       }
     }

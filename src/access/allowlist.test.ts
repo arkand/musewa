@@ -3,11 +3,11 @@ import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type AllowlistFile,
+  AllowlistStore,
   addDm,
   addGroup,
   addGroupMember,
-  AllowlistStore,
-  type AllowlistFile,
   isDmAllowed,
   isGroupConfigured,
   isGroupSenderAllowed,
@@ -75,13 +75,18 @@ describe("allowlist policy", () => {
     const allowlist: AllowlistFile = {
       dm: [],
       groups: {
-        [groupJid]: { allowAll: false, members: ["6281234567890@s.whatsapp.net"] },
+        [groupJid]: {
+          allowAll: false,
+          members: ["6281234567890@s.whatsapp.net"],
+        },
       },
     };
 
     expect(isGroupConfigured(allowlist, groupJid)).toBe(true);
     expect(
-      isGroupSenderAllowed(allowlist, groupJid, ["6281234567890@s.whatsapp.net"])
+      isGroupSenderAllowed(allowlist, groupJid, [
+        "6281234567890@s.whatsapp.net",
+      ])
     ).toBe(true);
     expect(
       isGroupSenderAllowed(allowlist, groupJid, ["999@s.whatsapp.net"])
@@ -96,9 +101,9 @@ describe("allowlist policy", () => {
       groups: { [groupJid]: { allowAll: true, members: [] } },
     };
 
-    expect(isGroupSenderAllowed(allowlist, groupJid, ["999@s.whatsapp.net"])).toBe(
-      true
-    );
+    expect(
+      isGroupSenderAllowed(allowlist, groupJid, ["999@s.whatsapp.net"])
+    ).toBe(true);
   });
 });
 
@@ -117,10 +122,17 @@ describe("allowlist mutations", () => {
     const groupJid = "120363000000000000@g.us";
     const withGroup = addGroup(empty, groupJid);
     const withMember = addGroupMember(withGroup, groupJid, "+6281234567890");
-    const withoutMember = removeGroupMember(withMember, groupJid, "+6281234567890");
+    const withoutMember = removeGroupMember(
+      withMember,
+      groupJid,
+      "+6281234567890"
+    );
     const withoutGroup = removeGroup(withoutMember, groupJid);
 
-    expect(withGroup.groups[groupJid]).toEqual({ allowAll: false, members: [] });
+    expect(withGroup.groups[groupJid]).toEqual({
+      allowAll: false,
+      members: [],
+    });
     expect(withMember.groups[groupJid]?.members).toEqual([
       "6281234567890@s.whatsapp.net",
     ]);
