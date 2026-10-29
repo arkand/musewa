@@ -71,5 +71,8 @@ export function explainGroupMessageHandling(input: {
 }
 
 export function stripWhatsAppBotMention(text: string): string {
-  return text.replace(/@\S+/g, "").replace(/\s+/g, " ").trim();
+  return text
+    .replace(/(?:^|\s)@\S+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }

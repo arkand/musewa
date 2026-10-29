@@ -13,6 +13,7 @@ import {
   stripWhatsAppBotMention,
 } from "../whatsapp/group-message";
 import type { WhatsAppInboundChat } from "../whatsapp/inbound-message";
+import { maskWhatsAppJid } from "../whatsapp/log-metadata";
 import { ConcurrencyLimiter, MessageDeduper, RateLimiter } from "./guards";
 
 const MAX_INPUT_BYTES = 16 * 1024;
@@ -145,7 +146,7 @@ export function createHandler(deps: HandlerDeps) {
     } catch (error) {
       logger.error("Muse reply failed.", {
         error: error instanceof Error ? error.message : String(error),
-        jid: inbound.jid,
+        jid: maskWhatsAppJid(inbound.jid),
       });
 
       try {

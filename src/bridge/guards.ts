@@ -69,6 +69,14 @@ export class RateLimiter {
     recent.push(now);
     this.hits.set(key, recent);
 
+    if (this.hits.size > 1000) {
+      for (const [k, timestamps] of this.hits) {
+        if (timestamps.every((t) => t <= cutoff)) {
+          this.hits.delete(k);
+        }
+      }
+    }
+
     return true;
   }
 }
