@@ -1,0 +1,26 @@
+[Unit]
+Description=Muse WhatsApp Bridge
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=muse-whatsapp
+Group=muse-whatsapp
+WorkingDirectory=/opt/muse-whatsapp
+EnvironmentFile=/etc/muse-whatsapp.env
+StateDirectory=muse-whatsapp
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/bun /opt/muse-whatsapp/dist/index.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/muse-whatsapp
+
+[Install]
+WantedBy=multi-user.target
