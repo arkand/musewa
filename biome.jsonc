@@ -9,6 +9,8 @@
       "complexity": {
         "noExcessiveCognitiveComplexity": "off",
         "noForEach": "off",
+        "noUselessUndefined": "off",
+        "noVoid": "off",
         "useOptionalChain": "off"
       },
       "performance": {
@@ -33,6 +35,7 @@
         "useErrorCause": "off"
       },
       "suspicious": {
+        "noEmptyBlockStatements": "off",
         "noExplicitAny": "off",
         "noUnnecessaryConditions": "off",
         "useAwait": "off"

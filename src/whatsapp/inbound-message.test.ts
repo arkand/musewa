@@ -1,0 +1,305 @@
+import { describe, expect, test } from "bun:test";
+import {
+  extractInboundText,
+  isPrivateWhatsAppChat,
+  isSelfWhatsAppChat,
+  isWhatsAppOutboundEcho,
+  parseInboundWhatsAppMessage,
+  rememberWhatsAppOutbound,
+  resetWhatsAppOutboundForTests,
+  shouldHandleInboundMessage,
+} from "./inbound-message";
+
+const ME = {
+  id: "6281379292556@s.whatsapp.net",
+  lid: "236283431522503@lid",
+};
+
+describe("inbound message routing", () => {
+  test("treats remembered fromMe group replies as outbound echoes", () => {
+    resetWhatsAppOutboundForTests();
+    rememberWhatsAppOutbound({
+      id: "out-1",
+      jid: "120363@g.us",
+      text: "Hi! Silakan kirim laporan well test yang ingin divalidasi.",
+    });
+
+    expect(
+      isWhatsAppOutboundEcho({
+        fromMe: true,
+        id: "out-1",
+        jid: "120363@g.us",
+        text: "Hi! Silakan kirim laporan well test yang ingin divalidasi.",
+      })
+    ).toBe(true);
+    expect(
+      isWhatsAppOutboundEcho({
+        fromMe: true,
+        jid: "120363@g.us",
+        text: "hi",
+      })
+    ).toBe(false);
+    expect(
+      isWhatsAppOutboundEcho({
+        fromMe: false,
+        id: "out-1",
+        jid: "120363@g.us",
+        text: "Hi! Silakan kirim laporan well test yang ingin divalidasi.",
+      })
+    ).toBe(false);
+  });
+
+  test("accepts private phone and lid chats", () => {
+    expect(isPrivateWhatsAppChat("6281379292556@s.whatsapp.net")).toBe(true);
+    expect(isPrivateWhatsAppChat("236283431522503@lid")).toBe(true);
+    expect(isPrivateWhatsAppChat("123@g.us")).toBe(false);
+  });
+
+  test("handles message-yourself traffic marked fromMe", () => {
+    const me = {
+      id: "6281379292556@s.whatsapp.net",
+      lid: "236283431522503@lid",
+    };
+
+    expect(
+      shouldHandleInboundMessage(
+        {
+          key: { fromMe: true, remoteJid: "236283431522503@lid" },
+          message: { conversation: "hello" },
+        },
+        me
+      )
+    ).toBe(true);
+    expect(isSelfWhatsAppChat("236283431522503@lid", me)).toBe(true);
+  });
+
+  test("ignores fromMe messages in other chats", () => {
+    expect(
+      shouldHandleInboundMessage(
+        {
+          key: { fromMe: true, remoteJid: "9999999999@s.whatsapp.net" },
+          message: { conversation: "hello" },
+        },
+        { id: "6281379292556@s.whatsapp.net", lid: "236283431522503@lid" }
+      )
+    ).toBe(false);
+  });
+
+  test("extracts text from ephemeral wrapped messages", () => {
+    // SAFETY: The fixture contains a Baileys ephemeral message wrapper.
+    expect(
+      extractInboundText({
+        ephemeralMessage: {
+          message: {
+            extendedTextMessage: {
+              text: "hello from wrapper",
+            },
+          },
+        },
+      } as any)
+    ).toBe("hello from wrapper");
+  });
+
+  test("accepts captionless photos and document captions", () => {
+    const key = { id: "photo-1", remoteJid: "9999999999@s.whatsapp.net" };
+    const photo = { mimetype: "image/jpeg" };
+    expect(
+      parseInboundWhatsAppMessage({ key, message: { imageMessage: photo } }, ME)
+    ).toMatchObject({
+      media: { kind: "image", message: photo },
+      messageId: "photo-1",
+      text: "",
+    });
+    expect(
+      parseInboundWhatsAppMessage(
+        {
+          key,
+          message: {
+            documentMessage: {
+              caption: "receipt",
+              mimetype: "application/pdf",
+            },
+          },
+        },
+        ME
+      )
+    ).toMatchObject({ media: { kind: "document" }, text: "receipt" });
+
+    const groupPhoto = {
+      key: { participant: key.remoteJid, remoteJid: "120363@g.us" },
+      message: {
+        imageMessage: {
+          contextInfo: { mentionedJid: [ME.id] },
+          mimetype: "image/jpeg",
+        },
+      },
+    };
+
+    expect(shouldHandleInboundMessage(groupPhoto, ME)).toBe(true);
+    expect(
+      shouldHandleInboundMessage(
+        {
+          ...groupPhoto,
+          message: { imageMessage: { mimetype: "image/jpeg" } },
+        },
+        ME
+      )
+    ).toBe(false);
+  });
+
+  test("extracts text from protobuf-like messages that only expose text via JSON", () => {
+    const payload = {
+      extendedTextMessage: {
+        get text() {
+          return undefined;
+        },
+        toJSON() {
+          return { text: "hi from toJSON" };
+        },
+      },
+      toJSON() {
+        return {
+          extendedTextMessage: {
+            text: "hi from toJSON",
+          },
+        };
+      },
+    };
+
+    // SAFETY: This fixture's `toJSON` output matches the protobuf message shape.
+    expect(extractInboundText(payload as any)).toBe("hi from toJSON");
+  });
+
+  test("ignores group messages without a mention, reply, or slash command", () => {
+    expect(
+      shouldHandleInboundMessage(
+        {
+          key: {
+            participant: "9999999999@s.whatsapp.net",
+            remoteJid: "120363@g.us",
+          },
+          message: { conversation: "hello everyone" },
+        },
+        ME
+      )
+    ).toBe(false);
+  });
+
+  test("handles plain group messages when mention is not required", () => {
+    expect(
+      shouldHandleInboundMessage(
+        {
+          key: {
+            participant: "9999999999@s.whatsapp.net",
+            remoteJid: "120363@g.us",
+          },
+          message: { conversation: "hello everyone" },
+        },
+        ME,
+        { requireGroupMention: false }
+      )
+    ).toBe(true);
+  });
+
+  test("handles group mentions, replies, and slash commands", () => {
+    expect(
+      shouldHandleInboundMessage(
+        {
+          key: {
+            participant: "9999999999@s.whatsapp.net",
+            remoteJid: "120363@g.us",
+          },
+          message: {
+            extendedTextMessage: {
+              contextInfo: { mentionedJid: [ME.id] },
+              text: "@Nakama hello",
+            },
+          },
+        },
+        ME
+      )
+    ).toBe(true);
+
+    expect(
+      shouldHandleInboundMessage(
+        {
+          key: {
+            participant: "9999999999@s.whatsapp.net",
+            remoteJid: "120363@g.us",
+          },
+          message: {
+            extendedTextMessage: {
+              contextInfo: { participant: ME.lid },
+              text: "follow up",
+            },
+          },
+        },
+        ME
+      )
+    ).toBe(true);
+  });
+
+  test("parseInboundWhatsAppMessage keeps group sender and chat JIDs separate", () => {
+    const inbound = parseInboundWhatsAppMessage(
+      {
+        key: {
+          participant: "104784384290844@lid",
+          participantPn: "9999999999@s.whatsapp.net",
+          remoteJid: "120363@g.us",
+        },
+        message: {
+          extendedTextMessage: {
+            contextInfo: { mentionedJid: [ME.lid] },
+            text: "@Nakama hello",
+          },
+        },
+      },
+      ME
+    );
+
+    expect(inbound).toEqual({
+      fromMe: false,
+      isGroup: true,
+      jid: "120363@g.us",
+      me: ME,
+      mentionedJids: [ME.lid],
+      messageId: null,
+      quotedParticipant: null,
+      quotedText: null,
+      senderJid: "9999999999@s.whatsapp.net",
+      senderJids: ["9999999999@s.whatsapp.net", "104784384290844@lid"],
+      text: "@Nakama hello",
+    });
+  });
+
+  test("parseInboundWhatsAppMessage keeps quoted message text", () => {
+    const inbound = parseInboundWhatsAppMessage(
+      {
+        key: {
+          participant: "9999999999@s.whatsapp.net",
+          remoteJid: "120363@g.us",
+        },
+        message: {
+          extendedTextMessage: {
+            contextInfo: {
+              mentionedJid: [ME.id],
+              participant: "6281352311912@s.whatsapp.net",
+              quotedMessage: {
+                conversation:
+                  "Update Daily Well PHSS 20-08-2026\nSFT-01 Unload flow",
+              },
+            },
+            text: "@Nakama ini data laporan hari berikutnya",
+          },
+        },
+      },
+      ME
+    );
+
+    expect(inbound?.quotedParticipant).toBe("6281352311912@s.whatsapp.net");
+    expect(inbound?.quotedText).toBe(
+      "Update Daily Well PHSS 20-08-2026\nSFT-01 Unload flow"
+    );
+    expect(inbound?.text).toBe("@Nakama ini data laporan hari berikutnya");
+  });
+});

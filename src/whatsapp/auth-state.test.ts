@@ -1,0 +1,161 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { usePrivateMultiFileAuthState } from "./auth-state";
+
+const POSIX = process.platform !== "win32";
+
+const temporaryDirectories: string[] = [];
+
+const PRE_KEY = {
+  private: Buffer.from([1, 2, 3]),
+  public: Buffer.from([4, 5, 6]),
+};
+
+let previousUmask: number | null = null;
+
+beforeEach(() => {
+  if (POSIX) {
+    previousUmask = process.umask(0o022);
+  }
+});
+
+afterEach(async () => {
+  if (previousUmask !== null) {
+    process.umask(previousUmask);
+    previousUmask = null;
+  }
+
+  for (const directory of temporaryDirectories.splice(0)) {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+async function createAuthDirectory(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "nakama-whatsapp-auth-state-"));
+  temporaryDirectories.push(root);
+
+  return join(root, "auth");
+}
+
+async function modeOf(path: string): Promise<number> {
+  // biome-ignore lint/suspicious/noBitwiseOperators: permission bits are stored in st_mode.
+  return (await stat(path)).mode & 0o777;
+}
+
+async function expectPrivate(
+  directory: string,
+  files: string[]
+): Promise<void> {
+  expect(await modeOf(directory)).toBe(0o700);
+
+  for (const file of files) {
+    expect(await modeOf(file)).toBe(0o600);
+  }
+}
+
+describe("private WhatsApp auth state", () => {
+  test("persists Baileys 7 identity mappings, devices, and tokens across reloads", async () => {
+    const authDirectory = await createAuthDirectory();
+
+    const { saveCreds, state } =
+      await usePrivateMultiFileAuthState(authDirectory);
+
+    const token = { timestamp: "123", token: Buffer.from([1, 2, 3]) };
+    await saveCreds();
+    await state.keys.set({
+      "device-list": { "123": ["0", "2"] },
+      "lid-mapping": { "123": "456" },
+      tctoken: { "456@lid": token },
+    });
+
+    const reloaded = await usePrivateMultiFileAuthState(authDirectory);
+    expect(reloaded.state.creds.registrationId).toBe(
+      state.creds.registrationId
+    );
+    expect(await reloaded.state.keys.get("lid-mapping", ["123"])).toEqual({
+      "123": "456",
+    });
+    expect(await reloaded.state.keys.get("device-list", ["123"])).toEqual({
+      "123": ["0", "2"],
+    });
+    expect(await reloaded.state.keys.get("tctoken", ["456@lid"])).toEqual({
+      "456@lid": token,
+    });
+  });
+
+  test.skipIf(!POSIX)(
+    "creates fresh credentials and Signal keys privately",
+    async () => {
+      const authDirectory = await createAuthDirectory();
+
+      const { saveCreds, state } =
+        await usePrivateMultiFileAuthState(authDirectory);
+
+      await saveCreds();
+      await state.keys.set({ "pre-key": { "1": PRE_KEY } });
+
+      expect(process.umask()).toBe(0o077);
+      await expectPrivate(authDirectory, [
+        join(authDirectory, "creds.json"),
+        join(authDirectory, "pre-key-1.json"),
+      ]);
+    }
+  );
+
+  test.skipIf(!POSIX)(
+    "preserves a stricter existing process umask",
+    async () => {
+      const authDirectory = await createAuthDirectory();
+      process.umask(0o177);
+
+      const { saveCreds } = await usePrivateMultiFileAuthState(authDirectory);
+      await saveCreds();
+
+      expect(process.umask()).toBe(0o177);
+      await expectPrivate(authDirectory, [join(authDirectory, "creds.json")]);
+    }
+  );
+
+  test.skipIf(!POSIX)(
+    "repairs existing loose permissions during startup",
+    async () => {
+      const authDirectory = await createAuthDirectory();
+      const existingFile = join(authDirectory, "existing.json");
+      await mkdir(authDirectory, { mode: 0o755 });
+      await writeFile(existingFile, "{}", { mode: 0o644 });
+      await chmod(authDirectory, 0o755);
+      await chmod(existingFile, 0o644);
+
+      await usePrivateMultiFileAuthState(authDirectory);
+
+      await expectPrivate(authDirectory, [existingFile]);
+    }
+  );
+
+  test.skipIf(!POSIX)(
+    "keeps credentials private across resave and reconnect",
+    async () => {
+      const authDirectory = await createAuthDirectory();
+      const credentialsPath = join(authDirectory, "creds.json");
+      const keyPath = join(authDirectory, "pre-key-1.json");
+      const files = [credentialsPath, keyPath];
+
+      const { saveCreds, state } =
+        await usePrivateMultiFileAuthState(authDirectory);
+
+      await saveCreds();
+      await state.keys.set({ "pre-key": { "1": PRE_KEY } });
+
+      await saveCreds();
+      await state.keys.set({ "pre-key": { "1": PRE_KEY } });
+      await expectPrivate(authDirectory, files);
+
+      const reconnected = await usePrivateMultiFileAuthState(authDirectory);
+      await reconnected.saveCreds();
+      await reconnected.state.keys.set({ "pre-key": { "1": PRE_KEY } });
+      await expectPrivate(authDirectory, files);
+    }
+  );
+});
