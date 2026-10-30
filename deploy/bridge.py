@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Muse bridge v5.1: OpenAI-compatible endpoint + worker pull API (no SSH).
 
-9Router 'muse' provider -> http://127.0.0.1:8765/v1      (key role=user)
-Muse worker (sandbox)   -> https://<tunnel-url>/muse/*    (key role=worker)
-                            tunnel via cloudflared quick tunnel (run-tunnel.ps1)
+WhatsApp bridge (src/muse/client.ts) -> http://127.0.0.1:8765/v1  (key role=user)
+Muse worker (sandbox)                -> https://<tunnel-url>/muse/*  (key role=worker)
+                                        tunnel via cloudflared quick tunnel (run-tunnel.ps1)
+
+Any OpenAI-compatible client can call /v1; the WhatsApp bridge is the one used
+in this project.
 
 v5.1 (fixes):
 - First worker answer wins: a duplicate /muse/answer no longer overwrites the
@@ -20,7 +23,7 @@ v5.1 (fixes):
 v5 (kept):
 - Role-based API keys stored in keys.json (NOT printed except at creation):
     python bridge.py keygen --role worker --label muse-vm   # prints key ONCE
-    python bridge.py keygen --role user   --label 9router
+    python bridge.py keygen --role user   --label whatsapp
     python bridge.py keylist                 # label/role/created/key-prefix only
     python bridge.py keydel <prefix|label>    # revoke
 - Worker pull API (all require `Authorization: Bearer <worker-key>`):
@@ -36,12 +39,11 @@ v5 (kept):
 
 v4 (kept):
 - Optional shared-token auth: set BRIDGE_TOKEN env. Still accepted on /v1/*
-  as a legacy user-role key (so an existing 9Router config keeps working).
+  as a legacy user-role key.
 - Request body cap (HTTP 413 over MAX_BODY).
 - processing/ dir + sweeper thread: stale/expired processing/ jobs are
   requeued, orphan done/ files are deleted.
 - Threaded server; SSE streaming with immediate headers + keepalives.
-- Dashboard probe shortcut ("hi" / max_tokens=1024 / non-streaming).
 
 Queue layout (under BRIDGE_QUEUE, default /home/ubuntu/muse-bridge/queue):
   pending/<id>.json      unleased jobs
@@ -308,34 +310,6 @@ def _sweeper():
 
 
 # ------------------------------------------------------------- handler ---
-def _is_dashboard_probe(req):
-    """Detect 9Router dashboard's 'Test Connection' probe (15s client timeout)."""
-    try:
-        if not isinstance(req, dict) or req.get("stream"):
-            return False
-        if req.get("max_tokens") != 1024:
-            return False
-        msgs = req.get("messages") or []
-        if not msgs:
-            return False
-        last = msgs[-1]
-        return (isinstance(last, dict) and last.get("role") == "user"
-                and str(last.get("content", "")).strip().lower() == "hi")
-    except Exception:
-        return False
-
-
-def _probe_completion():
-    cid = "chatcmpl-" + uuid.uuid4().hex[:12]
-    return {"id": cid, "object": "chat.completion", "created": int(time.time()),
-            "model": "muse",
-            "choices": [{"index": 0,
-                         "message": {"role": "assistant", "content":
-                                     "Halo! Muse online — bridge 9Router aktif dan siap."},
-                         "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
-
-
 class H(BaseHTTPRequestHandler):
     timeout = 120
 
@@ -478,8 +452,6 @@ class H(BaseHTTPRequestHandler):
                 req = self._read_json()
                 if req is None:
                     return
-                if _is_dashboard_probe(req):
-                    return self._send(200, _probe_completion())
                 rid = _enqueue_job(req)
                 if rid is None:
                     return self._send(429, {"error": {"message":
@@ -646,7 +618,8 @@ def cmd_serve():
 
 def main():
     ap = argparse.ArgumentParser(prog="bridge.py",
-                                 description="Muse bridge v5 for 9Router")
+                                 description="Muse bridge v5.1 "
+                                             "(OpenAI-compatible endpoint)")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("serve", help="run the HTTP bridge (default)")
     g = sub.add_parser("keygen", help="create an API key (printed once)")

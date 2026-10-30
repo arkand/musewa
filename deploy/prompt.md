@@ -14,7 +14,7 @@ punya SATU endpoint OpenAI-compatible yang jalan (ini yang dipakai sebagai
      `python3 /opt/muse-bridge/bridge.py serve` dengan env
      `BRIDGE_QUEUE=/var/lib/muse-bridge/queue` dan
      `BRIDGE_KEYS=/var/lib/muse-bridge/keys.json`.
-   - Generate key: `python3 /opt/muse-bridge/bridge.py keygen --role user --label 9router`
+   - Generate key: `python3 /opt/muse-bridge/bridge.py keygen --role user --label whatsapp`
      dan `... keygen --role worker --label muse-vm` (tiap key dicetak SEKALI).
    - Verifikasi:
        curl -s http://127.0.0.1:8765/health
@@ -34,19 +34,15 @@ punya SATU endpoint OpenAI-compatible yang jalan (ini yang dipakai sebagai
      `MUSE_MODEL=muse`, dan `MUSE_API_KEY=<USER_KEY>` dari langkah 1.
    - JANGAN start dulu: index.js akan exit (code 0) selama belum paired.
 
-3. Set Provider node "Muse" (openai-compatible →
-   http://127.0.0.1:8765/v1), connection, dan combo model publik "muse".
-   Model name bebas — bridge mengabaikannya dan selalu melayani "muse".
-
-4. Backup semua key (bridge user key, bridge worker key) ke file
+3. Backup semua key (bridge user key, bridge worker key) ke file
    terpisah permission 600 — jangan pernah tampilkan nilainya di chat.
 
-5. Pasang worker: scheduled task tiap 1 menit (poll /muse/pending, jawab sebagai
+4. Pasang worker: scheduled task tiap 1 menit (poll /muse/pending, jawab sebagai
    Muse, POST /muse/answer; diam kecuali bridge tak terjangkau / error auth)
    + hook 10 detik yang memantau folder antrean dan langsung membangunkan worker
    begitu ada job baru. Worker pakai WORKER_KEY (role=worker).
 
-6. Pairing + allowlist (WAJIB sebelum bridge WhatsApp bisa membalas):
+5. Pairing + allowlist (WAJIB sebelum bridge WhatsApp bisa membalas):
    - Pair nomor (cetak kode 8 karakter, lalu Perangkat Tertaut di HP):
        sudo systemctl stop muse-whatsapp
        sudo -u muse-whatsapp bun --env-file /etc/muse-whatsapp.env \
@@ -55,10 +51,11 @@ punya SATU endpoint OpenAI-compatible yang jalan (ini yang dipakai sebagai
        sudo -u muse-whatsapp bun --env-file /etc/muse-whatsapp.env \
          /opt/muse-whatsapp/dist/allow.js dm add +62<nomor-kamu>
 
-7. Jalankan WhatsApp bridge:
+6. Jalankan WhatsApp bridge:
        sudo systemctl enable --now muse-whatsapp
        journalctl -u muse-whatsapp -f
-   Provider WhatsApp sudah menunjuk http://127.0.0.1:8765/v1 model "muse".
+   Bridge WhatsApp sudah menunjuk http://127.0.0.1:8765/v1 model "muse"
+   (lewat .env di langkah 2).
 
 Laporkan ringkas: lokasi service/config/backup (path unit systemd, .env,
 keys backup, queue dir), tanpa menampilkan secret apa pun.
