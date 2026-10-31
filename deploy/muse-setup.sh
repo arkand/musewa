@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
 # ===========================================================================
-#  muse-setup.sh — pasang Muse WhatsApp Bridge di dalam VM Muse
+#  muse-setup.sh — pasang Muse WORKER untuk bridge.py di dalam VM Muse
 # ===========================================================================
+#  Peran VM Muse = WORKER (sandbox): menarik job dari bridge.py lewat pull API
+#  (/muse/pending, /muse/answer), menjawab pakai endpoint OpenAI-compatible
+#  LOKAL Muse, lalu mengirim balik jawabannya. VM Muse TIDAK meng-host WhatsApp
+#  dan TIDAK menjalankan bridge.py — itu hidup di VPS (lihat deploy/prompt.md).
+#
 #  Cara pakai (dari dalam terminal Muse):
-#      MUSE_BASE_URL=http://127.0.0.1:8080/v1 MUSE_MODEL=nama-model bash muse-setup.sh
-#  atau set dulu env-nya lalu:
+#      BRIDGE_URL=https://xxx.trycloudflare.com \
+#      BRIDGE_WORKER_KEY=Muse_kutkey_... \
+#      MUSE_BASE_URL=http://127.0.0.1:8080/v1 MUSE_MODEL=nama-model \
 #      bash muse-setup.sh
+#  atau set dulu env-nya lalu: bash muse-setup.sh
 #
 #  Yang dilakuin:
-#    1. Semua ditaruh di folder PERSISTEN (/home/hatch/pdata) — rootfs Muse
-#       read-only & dibangun ulang tiap boot.
-#    2. Pasang Bun (runtime bridge) ke dalam folder persisten.
-#    3. Ambil/perbarui kode bridge, install dependensi produksi, build.
-#    4. Tulis .env dari input kamu (TIDAK pasang gateway/penyedia model apa pun).
+#    1. Semua ditaruh di folder PERSISTEN (~/pdata) — rootfs Muse read-only &
+#       dibangun ulang tiap boot.
+#    2. Pastikan curl + jq ada (worker butuh keduanya).
+#    3. Ambil/perbarui kode repo (buat dapat deploy/muse-worker.sh).
+#    4. Tulis .env.worker dari input kamu (berisi worker key -> mode 600).
 #    5. Bikin launcher + respawn loop (Muse nggak punya systemd).
 #
-#  PENTING: script ini hanya memasang BRIDGE-nya, bukan penyedia model. Bridge
-#  butuh SATU endpoint OpenAI-compatible yang sudah jalan (MUSE_BASE_URL). Itu bisa:
-#    - API lokal milik Muse sendiri, atau
-#    - endpoint OpenAI-compatible lain yang kamu kelola.
+#  PENTING: script ini hanya memasang WORKER-nya. Butuh DUA hal sudah jalan:
+#    - bridge.py (OpenAI-compatible endpoint + queue) di VPS, reachable lewat
+#      BRIDGE_URL (biasanya tunnel cloudflared), dengan worker key-nya.
+#    - SATU endpoint OpenAI-compatible LOKAL milik Muse di MUSE_BASE_URL yang
+#      dipakai worker untuk benar-benar menjawab.
 #
 #  Aman dijalankan berulang: bagian yang sudah ada akan di-skip.
 # ===========================================================================
@@ -26,23 +34,20 @@ set -uo pipefail
 
 # --------------------------------------------------------------- konfigurasi
 PERSIST="${PERSIST:-$HOME/pdata}"          # SATU-SATUNYA folder yang awet di Muse
-BUN_DIR="$PERSIST/.bun"                     # instalasi Bun
-APP_DIR="$PERSIST/muse-whatsapp-bridge"     # checkout + build bridge
-STATE_DIR_DEFAULT="$PERSIST/state"          # STATE_DIR bridge (auth, history, allowlist)
-ENVF="$APP_DIR/.env"
+APP_DIR="$PERSIST/musewa"                   # checkout repo (buat muse-worker.sh)
+ENVF="$PERSIST/.env.worker"                 # config worker (berisi secret -> 600)
 REPO_URL="${REPO_URL:-https://github.com/arkand/musewa.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 
 # --- yang WAJIB kamu isi (atau pakai default) ------------------------------
-MUSE_BASE_URL="${MUSE_BASE_URL:-http://127.0.0.1:8080/v1}"
+BRIDGE_URL="${BRIDGE_URL:-}"                           # base URL bridge.py (VPS/tunnel)
+BRIDGE_WORKER_KEY="${BRIDGE_WORKER_KEY:-}"             # worker key (role=worker)
+MUSE_BASE_URL="${MUSE_BASE_URL:-http://127.0.0.1:8080/v1}"  # Muse lokal
 MUSE_MODEL="${MUSE_MODEL:-}"
 MUSE_API_KEY="${MUSE_API_KEY:-}"
-MUSE_SYSTEM_PROMPT_FILE="${MUSE_SYSTEM_PROMPT_FILE:-}"
-WHATSAPP_PHONE_NUMBER="${WHATSAPP_PHONE_NUMBER:-}"
-GROUP_REQUIRE_MENTION="${GROUP_REQUIRE_MENTION:-true}"
-HISTORY_MAX_TURNS="${HISTORY_MAX_TURNS:-20}"
+WORKER_BATCH="${WORKER_BATCH:-3}"
+WORKER_INTERVAL="${WORKER_INTERVAL:-5}"
 REQUEST_TIMEOUT_MS="${REQUEST_TIMEOUT_MS:-120000}"
-STATE_DIR="${STATE_DIR:-$STATE_DIR_DEFAULT}"
 
 C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_0=$'\033[0m'
 ok()   { printf '%s✓%s %s\n' "$C_OK" "$C_0" "$*"; }
@@ -63,53 +68,65 @@ else
 fi
 
 # Proxy: Muse memaksa egress lewat HTTPS_PROXY. localhost harus DIKECUALIKAN,
-# kalau tidak bridge->Muse API malah lewat proxy dan bisa kena Sentinel.
+# kalau tidak worker->Muse lokal malah lewat proxy dan bisa kena Sentinel.
+# (BRIDGE_URL yang publik TETAP boleh lewat proxy — itu memang egress keluar.)
 export NO_PROXY="localhost,127.0.0.1,::1${NO_PROXY:+,$NO_PROXY}"
 export no_proxy="$NO_PROXY"
 if [ -n "${HTTPS_PROXY:-}" ]; then
   ok "proxy egress terdeteksi (kredensial tidak ditampilkan)"
 else
-  warn "HTTPS_PROXY kosong — kalau download gagal, itu sebabnya"
+  warn "HTTPS_PROXY kosong — kalau akses BRIDGE_URL gagal, itu bisa sebabnya"
 fi
 
-mkdir -p "$PERSIST" "$PERSIST/logs" "$PERSIST/bin" "$PERSIST/tmp" "$STATE_DIR"
-chmod 700 "$STATE_DIR" 2>/dev/null || true
+mkdir -p "$PERSIST" "$PERSIST/logs" "$PERSIST/bin" "$PERSIST/tmp"
 ok "folder persisten: $PERSIST"
 
 export TMPDIR="$PERSIST/tmp"
 # Muse/container: ekstraksi tar sebagai root gagal "tar: Cannot change ownership".
-# --no-same-owner membuat tar mengabaikan ownership. Berlaku untuk installer Bun juga.
 export TAR_OPTIONS="--no-same-owner"
-# Bun duluan di PATH supaya `bun` = yang kita pasang di folder persisten.
-export BUN_INSTALL="$BUN_DIR"
-export PATH="$BUN_DIR/bin:$PERSIST/bin:$PATH"
+export PATH="$PERSIST/bin:$PATH"
 
-[ -n "$MUSE_MODEL" ] || warn "MUSE_MODEL kosong — bridge nggak akan start sampai ini diisi"
+# --- validasi input WAJIB --------------------------------------------------
+[ -n "$BRIDGE_URL" ]        || warn "BRIDGE_URL kosong — worker nggak akan start sampai ini diisi"
+[ -n "$BRIDGE_WORKER_KEY" ] || warn "BRIDGE_WORKER_KEY kosong — worker nggak akan start sampai ini diisi"
+[ -n "$MUSE_MODEL" ]        || warn "MUSE_MODEL kosong — worker nggak akan start sampai ini diisi"
 
-# ------------------------------------------------------------------ 1. Bun
-step "1. Pasang Bun (runtime bridge)"
+# ---------------------------------------------------------- 1. curl + jq
+step "1. Cek dependensi (curl, jq)"
 
-if command -v bun >/dev/null 2>&1 && [ -x "$BUN_DIR/bin/bun" ]; then
-  ok "Bun sudah terpasang — skip ($(bun --version))"
+command -v curl >/dev/null 2>&1 || die "curl tidak ada — pasang dulu (worker butuh curl)"
+ok "curl: $(command -v curl)"
+
+if command -v jq >/dev/null 2>&1; then
+  ok "jq: $(command -v jq) ($(jq --version 2>/dev/null))"
 else
-  # Installer resmi Bun. BUN_INSTALL mengarah ke folder persisten.
-  curl -fsSL --max-time 120 https://bun.sh/install \
-    | bash >"$PERSIST/logs/bun-install.log" 2>&1 \
-    || { tail -n 20 "$PERSIST/logs/bun-install.log"; die "gagal pasang Bun (cek koneksi/proxy)"; }
-  [ -x "$BUN_DIR/bin/bun" ] || die "Bun terpasang tapi binary tidak ketemu di $BUN_DIR/bin/bun"
-  ok "Bun terpasang ($("$BUN_DIR/bin/bun" --version))"
+  # Coba unduh jq statis ke folder persisten (tanpa hak root / paket sistem).
+  warn "jq tidak ada — coba unduh binary statis ke $PERSIST/bin"
+  JQ_ARCH="$(uname -m)"
+  case "$JQ_ARCH" in
+    x86_64|amd64) JQ_URL="https://github.com/jqlang/jq/releases/latest/download/jq-linux-amd64" ;;
+    aarch64|arm64) JQ_URL="https://github.com/jqlang/jq/releases/latest/download/jq-linux-arm64" ;;
+    *) JQ_URL="" ;;
+  esac
+  if [ -n "$JQ_URL" ] && curl -fsSL --max-time 60 "$JQ_URL" -o "$PERSIST/bin/jq" 2>>"$PERSIST/logs/jq-install.log"; then
+    chmod +x "$PERSIST/bin/jq"
+    "$PERSIST/bin/jq" --version >/dev/null 2>&1 \
+      && ok "jq terpasang: $PERSIST/bin/jq" \
+      || die "jq terunduh tapi tidak jalan (arsitektur $JQ_ARCH?)"
+  else
+    die "gagal menyediakan jq (arch=$JQ_ARCH). Pasang jq manual lalu ulangi."
+  fi
 fi
-BUN_BIN="$BUN_DIR/bin/bun"
 
-# ------------------------------------------------------- 2. Ambil kode bridge
-step "2. Ambil / perbarui kode bridge"
+# ------------------------------------------------------- 2. Ambil kode repo
+step "2. Ambil / perbarui kode repo"
 
 if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" fetch --depth 1 origin "$REPO_BRANCH" >/dev/null 2>&1 \
     && git -C "$APP_DIR" reset --hard "origin/$REPO_BRANCH" >/dev/null 2>&1 \
     && ok "kode diperbarui dari origin/$REPO_BRANCH" \
     || warn "gagal update git — pakai yang sudah ada di $APP_DIR"
-elif [ -f "$APP_DIR/package.json" ]; then
+elif [ -f "$APP_DIR/deploy/muse-worker.sh" ]; then
   ok "kode sudah ada di $APP_DIR (bukan git) — pakai apa adanya"
 else
   if command -v git >/dev/null 2>&1; then
@@ -120,158 +137,130 @@ else
     die "git tidak ada dan $APP_DIR kosong. Pasang git atau upload kode manual ke $APP_DIR."
   fi
 fi
-[ -f "$APP_DIR/package.json" ] || die "package.json tidak ketemu di $APP_DIR"
+WORKER_SRC="$APP_DIR/deploy/muse-worker.sh"
+[ -f "$WORKER_SRC" ] || die "deploy/muse-worker.sh tidak ketemu di $APP_DIR"
 
-# ------------------------------------------------ 3. Install deps + build
-step "3. Install dependensi produksi + build"
+# Salin poller ke folder bin persisten agar stabil terhadap update checkout.
+install -m 0755 "$WORKER_SRC" "$PERSIST/bin/muse-worker.sh" 2>/dev/null \
+  || { cp "$WORKER_SRC" "$PERSIST/bin/muse-worker.sh"; chmod +x "$PERSIST/bin/muse-worker.sh"; }
+ok "poller: $PERSIST/bin/muse-worker.sh"
 
-cd "$APP_DIR" || die "tidak bisa masuk $APP_DIR"
-export npm_config_cache="$PERSIST/npm-cache"
+# ------------------------------------------------------------- 3. Tulis .env
+step "3. Tulis konfigurasi ($ENVF)"
 
-# Install produksi di VM (bukan copy node_modules host) agar Baileys cocok arsitektur.
-if [ -f bun.lock ]; then
-  "$BUN_BIN" install --production --frozen-lockfile >"$PERSIST/logs/bun-install-deps.log" 2>&1 \
-    || "$BUN_BIN" install --production >"$PERSIST/logs/bun-install-deps.log" 2>&1 \
-    || { tail -n 20 "$PERSIST/logs/bun-install-deps.log"; die "gagal install dependensi"; }
-else
-  "$BUN_BIN" install --production >"$PERSIST/logs/bun-install-deps.log" 2>&1 \
-    || { tail -n 20 "$PERSIST/logs/bun-install-deps.log"; die "gagal install dependensi"; }
-fi
-ok "dependensi terpasang"
-
-"$BUN_BIN" run build >"$PERSIST/logs/bun-build.log" 2>&1 \
-  || { tail -n 20 "$PERSIST/logs/bun-build.log"; die "gagal build (cek log)"; }
-[ -f "$APP_DIR/dist/index.js" ] || die "build selesai tapi dist/index.js tidak ada"
-ok "build selesai (dist/index.js, dist/pair.js, dist/allow.js)"
-
-# ------------------------------------------------------------- 4. Tulis .env
-step "4. Tulis konfigurasi (.env)"
-
-# .env berisi secret (MUSE_API_KEY). Dibuat 600.
+# .env.worker berisi secret (BRIDGE_WORKER_KEY, MUSE_API_KEY). Dibuat 600.
 touch "$ENVF"; chmod 600 "$ENVF"
 {
+  printf 'BRIDGE_URL=%s\n' "$BRIDGE_URL"
+  printf 'BRIDGE_WORKER_KEY=%s\n' "$BRIDGE_WORKER_KEY"
   printf 'MUSE_BASE_URL=%s\n' "$MUSE_BASE_URL"
-  printf 'MUSE_API_KEY=%s\n' "$MUSE_API_KEY"
   printf 'MUSE_MODEL=%s\n' "$MUSE_MODEL"
-  [ -n "$MUSE_SYSTEM_PROMPT_FILE" ] && printf 'MUSE_SYSTEM_PROMPT_FILE=%s\n' "$MUSE_SYSTEM_PROMPT_FILE"
-  printf 'STATE_DIR=%s\n' "$STATE_DIR"
-  [ -n "$WHATSAPP_PHONE_NUMBER" ] && printf 'WHATSAPP_PHONE_NUMBER=%s\n' "$WHATSAPP_PHONE_NUMBER"
-  printf 'GROUP_REQUIRE_MENTION=%s\n' "$GROUP_REQUIRE_MENTION"
-  printf 'HISTORY_MAX_TURNS=%s\n' "$HISTORY_MAX_TURNS"
+  [ -n "$MUSE_API_KEY" ] && printf 'MUSE_API_KEY=%s\n' "$MUSE_API_KEY"
+  printf 'WORKER_BATCH=%s\n' "$WORKER_BATCH"
+  printf 'WORKER_INTERVAL=%s\n' "$WORKER_INTERVAL"
   printf 'REQUEST_TIMEOUT_MS=%s\n' "$REQUEST_TIMEOUT_MS"
 } > "$ENVF"
-ok ".env ditulis (mode 600) -> MUSE_BASE_URL=$MUSE_BASE_URL"
+ok ".env.worker ditulis (mode 600) -> BRIDGE_URL=${BRIDGE_URL:-<kosong>} MUSE_BASE_URL=$MUSE_BASE_URL"
 
-# --------------------------------------------------- 5. Launcher + boot loop
-step "5. Bikin launcher + respawn loop"
+# --------------------------------------------------- 4. Launcher + boot loop
+step "4. Bikin launcher + respawn loop"
 
-# Boot loop: jaga bridge tetap hidup. Muse nggak punya systemd. Panggil dari
-# Muse Scheduled Task tiap boot, atau lewat launcher `muse-wa`.
-cat > "$PERSIST/bin/muse-wa-boot.sh" <<'BOOT'
+# Boot loop: jaga worker tetap hidup. Muse nggak punya systemd. Panggil dari
+# Muse Scheduled Task tiap boot, atau lewat launcher `muse-worker`.
+cat > "$PERSIST/bin/muse-worker-boot.sh" <<'BOOT'
 #!/usr/bin/env bash
-# Jalankan Muse WhatsApp Bridge dan jaga tetap hidup (pengganti systemd).
+# Jalankan Muse worker dan jaga tetap hidup (pengganti systemd).
 set -uo pipefail
 PERSIST="${PERSIST:-$HOME/pdata}"
-APP_DIR="$PERSIST/muse-whatsapp-bridge"
-ENVF="$APP_DIR/.env"
-BUN_BIN="$PERSIST/.bun/bin/bun"
-LOG="$PERSIST/logs/muse-wa.log"
+ENVF="$PERSIST/.env.worker"
+WORKER="$PERSIST/bin/muse-worker.sh"
+LOG="$PERSIST/logs/muse-worker.log"
 
-export BUN_INSTALL="$PERSIST/.bun"
-export PATH="$PERSIST/.bun/bin:$PERSIST/bin:$PATH"
+export PATH="$PERSIST/bin:$PATH"
 export NO_PROXY="localhost,127.0.0.1,::1${NO_PROXY:+,$NO_PROXY}"
 export no_proxy="$NO_PROXY"
 export TAR_OPTIONS="--no-same-owner"
 mkdir -p "$PERSIST/logs"
 
-[ -x "$BUN_BIN" ] || { echo "[muse-wa] bun tidak ada di $BUN_BIN" >>"$PERSIST/logs/boot.log"; exit 1; }
-[ -f "$APP_DIR/dist/index.js" ] || { echo "[muse-wa] dist/index.js tidak ada — build dulu" >>"$PERSIST/logs/boot.log"; exit 1; }
+[ -f "$WORKER" ] || { echo "[muse-worker] $WORKER tidak ada — jalankan muse-setup.sh" >>"$PERSIST/logs/boot.log"; exit 1; }
+[ -f "$ENVF" ]   || { echo "[muse-worker] $ENVF tidak ada — jalankan muse-setup.sh" >>"$PERSIST/logs/boot.log"; exit 1; }
 
-# Belum paired? index.js keluar kode 0 dan mencetak instruksi. Loop ini akan
-# mencoba lagi tiap 30s sampai creds muncul (setelah kamu pairing manual).
-echo "[$(date -Is)] start muse-whatsapp-bridge" >>"$PERSIST/logs/boot.log"
-cd "$APP_DIR" || exit 1
+echo "[$(date -Is 2>/dev/null || date)] start muse-worker" >>"$PERSIST/logs/boot.log"
 while true; do
-  "$BUN_BIN" --env-file "$ENVF" run dist/index.js >>"$LOG" 2>&1
-  echo "[$(date -Is)] bridge berhenti, restart 10s" >>"$PERSIST/logs/boot.log"
+  # Muat .env.worker ke environment lalu jalankan poller.
+  set -a; . "$ENVF"; set +a
+  bash "$WORKER" >>"$LOG" 2>&1
+  echo "[$(date -Is 2>/dev/null || date)] worker berhenti, restart 10s" >>"$PERSIST/logs/boot.log"
   sleep 10
 done
 BOOT
-chmod +x "$PERSIST/bin/muse-wa-boot.sh"
-ok "$PERSIST/bin/muse-wa-boot.sh"
+chmod +x "$PERSIST/bin/muse-worker-boot.sh"
+ok "$PERSIST/bin/muse-worker-boot.sh"
 
-# Launcher utama `muse-wa`: subcommand pairing / allow / start / log.
-cat > "$PERSIST/bin/muse-wa" <<'WRAP'
+# Launcher utama `muse-worker`: start / up / log / status / once.
+cat > "$PERSIST/bin/muse-worker" <<'WRAP'
 #!/usr/bin/env bash
-# muse-wa — kontrol Muse WhatsApp Bridge.
-#   muse-wa pair --phone +62...        minta pairing code
-#   muse-wa allow dm add +62...        tambah nomor ke allowlist
-#   muse-wa allow group add <jid>      tambah grup
-#   muse-wa start                      jalankan bridge (respawn loop, foreground)
-#   muse-wa up                         jalankan bridge di background (setsid)
-#   muse-wa log                        ikuti log bridge
-#   muse-wa status                     cek proses & paired
+# muse-worker — kontrol Muse worker (pull API bridge.py).
+#   muse-worker start     jalankan worker (respawn loop, foreground)
+#   muse-worker up        jalankan worker di background (setsid)
+#   muse-worker once      satu putaran poll+answer lalu keluar (buat tes)
+#   muse-worker log       ikuti log worker
+#   muse-worker status    cek proses jalan/mati + config ringkas
 set -uo pipefail
 PERSIST="${PERSIST:-$HOME/pdata}"
-APP_DIR="$PERSIST/muse-whatsapp-bridge"
-ENVF="$APP_DIR/.env"
-BUN_BIN="$PERSIST/.bun/bin/bun"
+ENVF="$PERSIST/.env.worker"
+WORKER="$PERSIST/bin/muse-worker.sh"
 
-export BUN_INSTALL="$PERSIST/.bun"
-export PATH="$PERSIST/.bun/bin:$PERSIST/bin:$PATH"
+export PATH="$PERSIST/bin:$PATH"
 export NO_PROXY="localhost,127.0.0.1,::1${NO_PROXY:+,$NO_PROXY}"
 export no_proxy="$NO_PROXY"
 export TAR_OPTIONS="--no-same-owner"
 
-[ -x "$BUN_BIN" ] || { echo "[X] bun tidak ada di $BUN_BIN — jalankan ulang muse-setup.sh" >&2; exit 1; }
-[ -f "$APP_DIR/package.json" ] || { echo "[X] kode bridge tidak ada di $APP_DIR" >&2; exit 1; }
-cd "$APP_DIR" || exit 1
+[ -f "$WORKER" ] || { echo "[X] $WORKER tidak ada — jalankan ulang muse-setup.sh" >&2; exit 1; }
+[ -f "$ENVF" ]   || { echo "[X] $ENVF tidak ada — jalankan ulang muse-setup.sh" >&2; exit 1; }
 
 cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
-  pair)   exec "$BUN_BIN" --env-file "$ENVF" run src/cli/pair.ts "$@" ;;
-  allow)  exec "$BUN_BIN" --env-file "$ENVF" run src/cli/allow.ts "$@" ;;
-  start)  exec bash "$PERSIST/bin/muse-wa-boot.sh" ;;
+  start) set -a; . "$ENVF"; set +a; exec bash "$PERSIST/bin/muse-worker-boot.sh" ;;
   up)
     if command -v setsid >/dev/null 2>&1; then
-      setsid bash "$PERSIST/bin/muse-wa-boot.sh" >/dev/null 2>&1 </dev/null &
+      setsid bash "$PERSIST/bin/muse-worker-boot.sh" >/dev/null 2>&1 </dev/null &
     else
-      nohup bash "$PERSIST/bin/muse-wa-boot.sh" >/dev/null 2>&1 </dev/null &
+      nohup bash "$PERSIST/bin/muse-worker-boot.sh" >/dev/null 2>&1 </dev/null &
     fi
-    echo "[i] bridge dinyalakan di background — log: muse-wa log" ;;
-  log)    exec tail -n 100 -f "$PERSIST/logs/muse-wa.log" ;;
+    echo "[i] worker dinyalakan di background — log: muse-worker log" ;;
+  once)  set -a; . "$ENVF"; set +a; exec env WORKER_INTERVAL=0 WORKER_ONCE=1 bash "$WORKER" ;;
+  log)   exec tail -n 100 -f "$PERSIST/logs/muse-worker.log" ;;
   status)
-    if pgrep -f 'dist/index.js' >/dev/null 2>&1; then echo "[i] bridge: JALAN"; else echo "[i] bridge: MATI"; fi
-    state_dir="$PERSIST/state"
+    if pgrep -f 'muse-worker.sh' >/dev/null 2>&1; then echo "[i] worker: JALAN"; else echo "[i] worker: MATI"; fi
     if [ -f "$ENVF" ]; then
-      from_env="$(grep -E '^STATE_DIR=' "$ENVF" 2>/dev/null | tail -n1 | cut -d= -f2-)"
-      [ -n "$from_env" ] && state_dir="$from_env"
-    fi
-    if [ -f "$state_dir/auth/creds.json" ]; then
-      echo "[i] paired: YA ($state_dir)"
-    else
-      echo "[i] paired: BELUM — jalankan: muse-wa pair --phone +62..."
+      bu="$(grep -E '^BRIDGE_URL=' "$ENVF" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+      mu="$(grep -E '^MUSE_BASE_URL=' "$ENVF" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+      mm="$(grep -E '^MUSE_MODEL=' "$ENVF" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+      echo "[i] bridge   : ${bu:-<kosong>}"
+      echo "[i] muse     : ${mu:-<kosong>} (model ${mm:-<kosong>})"
+      grep -qE '^BRIDGE_WORKER_KEY=.+' "$ENVF" 2>/dev/null \
+        && echo "[i] worker key: ADA (tidak ditampilkan)" \
+        || echo "[i] worker key: BELUM diisi"
     fi ;;
   *)
-    echo "pakai: muse-wa {pair|allow|start|up|log|status}" >&2
-    echo "  muse-wa pair --phone +62..." >&2
-    echo "  muse-wa allow dm add +62..." >&2
-    echo "  muse-wa up        # jalan di background" >&2
+    echo "pakai: muse-worker {start|up|once|log|status}" >&2
+    echo "  muse-worker up        # jalan di background" >&2
+    echo "  muse-worker once      # satu putaran buat tes" >&2
     exit 2 ;;
 esac
 WRAP
-chmod +x "$PERSIST/bin/muse-wa"
-ok "$PERSIST/bin/muse-wa"
+chmod +x "$PERSIST/bin/muse-worker"
+ok "$PERSIST/bin/muse-worker"
 
-# Autoload: terminal BARU langsung punya `bun` dan `muse-wa`.
-MARK="# >>> muse-whatsapp >>>"
+# Autoload: terminal BARU langsung punya `muse-worker` di PATH.
+MARK="# >>> muse-worker >>>"
 BLOCK="$MARK
-export BUN_INSTALL=\"\$HOME/pdata/.bun\"
-export PATH=\"\$HOME/pdata/.bun/bin:\$HOME/pdata/bin:\$PATH\"
+export PATH=\"\$HOME/pdata/bin:\$PATH\"
 export NO_PROXY=\"localhost,127.0.0.1,::1\${NO_PROXY:+,\$NO_PROXY}\"
 export no_proxy=\"\$NO_PROXY\"
 export TAR_OPTIONS=\"--no-same-owner\"
-# <<< muse-whatsapp <<<"
+# <<< muse-worker <<<"
 
 for rc in "$HOME/.bashrc" "$HOME/.profile"; do
   [ -e "$rc" ] || touch "$rc"
@@ -283,28 +272,51 @@ for rc in "$HOME/.bashrc" "$HOME/.profile"; do
   fi
 done
 
-# ---------------------------------------------------------------- 6. Verifikasi
-step "6. Verifikasi"
+# ---------------------------------------------------------------- 5. Verifikasi
+step "5. Verifikasi"
 
 FAIL=0
+command -v curl >/dev/null 2>&1 && ok "curl ada" || { err "curl tidak ada"; FAIL=1; }
+command -v jq   >/dev/null 2>&1 || [ -x "$PERSIST/bin/jq" ] && ok "jq ada" || { err "jq tidak ada"; FAIL=1; }
+[ -x "$PERSIST/bin/muse-worker.sh" ] && ok "poller siap" || { err "poller tidak ada"; FAIL=1; }
+[ -x "$PERSIST/bin/muse-worker" ]    && ok "launcher muse-worker siap" || { err "launcher tidak ada"; FAIL=1; }
+[ -f "$ENVF" ] && ok ".env.worker ada (mode $(stat -c '%a' "$ENVF" 2>/dev/null || echo '?'))" || { err ".env.worker tidak ada"; FAIL=1; }
 
-[ -x "$BUN_BIN" ] && ok "Bun: $BUN_BIN" || { err "Bun tidak ada"; FAIL=1; }
-[ -f "$APP_DIR/dist/index.js" ] && ok "bridge ter-build: $APP_DIR/dist/index.js" || { err "build bridge tidak ada"; FAIL=1; }
-[ -f "$ENVF" ] && ok ".env ada (mode $(stat -c '%a' "$ENVF" 2>/dev/null || echo '?'))" || { err ".env tidak ada"; FAIL=1; }
-[ -x "$PERSIST/bin/muse-wa" ] && ok "launcher muse-wa siap" || { err "launcher muse-wa tidak ada"; FAIL=1; }
+# Cek bridge + Muse lokal — informasi saja, tidak bikin FAIL.
+step "5b. Cek koneksi (opsional)"
 
-# Cek endpoint Muse — informasi saja, tidak bikin FAIL (bisa belum ada provider).
-step "6b. Cek endpoint Muse (opsional)"
-HEALTH_URL="${MUSE_BASE_URL%/}/models"
+if [ -n "$BRIDGE_URL" ]; then
+  HCODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${BRIDGE_URL%/}/health" 2>/dev/null || echo 000)"
+  case "$HCODE" in
+    200) ok "bridge /health 200 di ${BRIDGE_URL%/}/health" ;;
+    000) warn "bridge tak terjangkau di $BRIDGE_URL (tunnel belum jalan?)" ;;
+    *)   warn "bridge /health balas HTTP $HCODE" ;;
+  esac
+  if [ -n "$BRIDGE_WORKER_KEY" ]; then
+    PCODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+      -H "Authorization: Bearer $BRIDGE_WORKER_KEY" \
+      "${BRIDGE_URL%/}/muse/pending?limit=1" 2>/dev/null || echo 000)"
+    case "$PCODE" in
+      200) ok "worker key valid (/muse/pending 200)" ;;
+      401|403) warn "worker key DITOLAK (HTTP $PCODE) — cek BRIDGE_WORKER_KEY / role=worker" ;;
+      000) warn "tidak bisa cek /muse/pending (bridge tak terjangkau)" ;;
+      *)   warn "/muse/pending balas HTTP $PCODE" ;;
+    esac
+  fi
+else
+  warn "BRIDGE_URL kosong — lewati cek bridge"
+fi
+
+MHEALTH="${MUSE_BASE_URL%/}/models"
 AUTH_ARG=()
 [ -n "$MUSE_API_KEY" ] && AUTH_ARG=(-H "Authorization: Bearer $MUSE_API_KEY")
-CODE="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 8 \
-  "${AUTH_ARG[@]}" "$HEALTH_URL" 2>/dev/null || echo 000)"
-case "$CODE" in
-  200)     ok "Muse API merespons 200 di $HEALTH_URL" ;;
-  401|403) warn "Muse API menolak (HTTP $CODE) — cek MUSE_API_KEY" ;;
-  000)     warn "Muse API tidak merespons di $MUSE_BASE_URL — pastikan endpoint OpenAI-compatible-nya sudah jalan" ;;
-  *)       warn "Muse API balas HTTP $CODE (bisa normal tergantung provider)" ;;
+MCODE="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 8 \
+  ${AUTH_ARG[@]+"${AUTH_ARG[@]}"} "$MHEALTH" 2>/dev/null || echo 000)"
+case "$MCODE" in
+  200)     ok "Muse lokal merespons 200 di $MHEALTH" ;;
+  401|403) warn "Muse lokal menolak (HTTP $MCODE) — cek MUSE_API_KEY" ;;
+  000)     warn "Muse lokal tidak merespons di $MUSE_BASE_URL — pastikan endpoint OpenAI-compatible-nya jalan" ;;
+  *)       warn "Muse lokal balas HTTP $MCODE (bisa normal tergantung provider)" ;;
 esac
 
 cat <<EOF
@@ -313,37 +325,36 @@ cat <<EOF
  SELESAI
 ===========================================================================
   Persisten   : $PERSIST
-  Bun         : $BUN_DIR
-  Bridge      : $APP_DIR
-  State dir   : $STATE_DIR
-  Konfig      : $ENVF  (MUSE_BASE_URL=$MUSE_BASE_URL)
-  Launcher    : muse-wa   (terminal baru; kalau ini lama: source ~/.bashrc)
+  Repo        : $APP_DIR
+  Poller      : $PERSIST/bin/muse-worker.sh
+  Konfig      : $ENVF  (mode 600)
+  Launcher    : muse-worker   (terminal baru; kalau ini lama: source ~/.bashrc)
 
  LANGKAH MANUAL (sekali saja):
-   1. Pastikan endpoint OpenAI-compatible Muse kamu jalan di:
+   1. Pastikan bridge.py jalan di VPS dan BRIDGE_URL bisa diakses dari VM:
+        curl -s ${BRIDGE_URL:-https://xxx.trycloudflare.com}/health
+   2. Pastikan endpoint OpenAI-compatible LOKAL Muse jalan di:
         $MUSE_BASE_URL
-      (script ini TIDAK memasang gateway/penyedia model apa pun.)
-   2. Pairing nomor WhatsApp (cetak kode 8 karakter):
-        muse-wa pair --phone +62...
-      Di HP: WhatsApp > Perangkat Tertaut > Tautkan dengan nomor telepon.
-   3. Izinkan nomor yang boleh chat:
-        muse-wa allow dm add +62<nomor-kamu>
-   4. Jalankan bridge:
-        muse-wa up        # background (respawn loop)
-        muse-wa log       # lihat log
-        muse-wa status    # cek jalan / paired
+   3. Tes satu putaran (tanpa respawn loop):
+        muse-worker once
+   4. Jalankan worker terus-menerus:
+        muse-worker up        # background (respawn loop)
+        muse-worker log       # lihat log
+        muse-worker status    # cek jalan + config ringkas
    5. Biar nyala sendiri tiap VM bangun, daftarkan
-        $PERSIST/bin/muse-wa-boot.sh
+        $PERSIST/bin/muse-worker-boot.sh
       di Muse Scheduled Task.
 
  CATATAN PENTING:
    - Rootfs Muse read-only & dibangun ulang tiap boot. Semua di bawah
      $PERSIST. JANGAN install di luar itu — hilang saat VM restart.
    - Sentinel mengintip koneksi keluar. localhost sudah di-NO_PROXY supaya
-     bridge->Muse API tidak lewat proxy.
-   - MUSE_BASE_URL menunjuk endpoint OpenAI-compatible yang KAMU sediakan.
-     Script ini hanya memasang bridge-nya, bukan penyedia model.
-   - Baileys tidak resmi. Pakai nomor cadangan, volume pesan rendah.
+     worker->Muse lokal tidak lewat proxy. BRIDGE_URL yang publik memang
+     lewat egress (boleh kena proxy).
+   - Worker DIAM kecuali ada error nyata (bridge tak terjangkau, auth salah,
+     Muse lokal error). Tidak pernah mencetak isi pesan atau secret.
+   - bridge.py & WhatsApp bridge ada di VPS, bukan di sini (lihat
+     deploy/prompt.md). VM ini cuma WORKER.
    - Ini pemakaian di luar ToS Muse. Risiko ban ada di kamu.
 ===========================================================================
 EOF
