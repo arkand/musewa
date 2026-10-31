@@ -3,9 +3,10 @@ end-to-end dalam satu sesi. Target: VPS biasa yang punya systemd — BUKAN
 VM Muse. (Untuk VM Muse yang read-only tanpa systemd, pakai
 `deploy/muse-setup.sh` + respawn loop, bukan runbook ini.)
 
-Asumsi: Bun 1.4+ sudah terpasang di `/usr/local/bin/bun` dan Muse sudah
-punya SATU endpoint OpenAI-compatible yang jalan (ini yang dipakai sebagai
-`MUSE_BASE_URL`). Jangan tampilkan secret apa pun di output.
+Asumsi: Bun 1.4+ sudah terpasang di `/usr/local/bin/bun`. Di arsitektur ini
+endpoint model Muse yang asli hidup di VM Muse (dipakai worker di langkah 4);
+`MUSE_BASE_URL` milik WhatsApp bridge justru menunjuk ke bridge.py
+(`:8765/v1`), lihat langkah 2. Jangan tampilkan secret apa pun di output.
 
 1. Deploy bridge.py (file terlampir, v5.1) sebagai systemd service
    (bind 127.0.0.1:8765, antrean file):
@@ -37,10 +38,25 @@ punya SATU endpoint OpenAI-compatible yang jalan (ini yang dipakai sebagai
 3. Backup semua key (bridge user key, bridge worker key) ke file
    terpisah permission 600 — jangan pernah tampilkan nilainya di chat.
 
-4. Pasang worker: scheduled task tiap 1 menit (poll /muse/pending, jawab sebagai
-   Muse, POST /muse/answer; diam kecuali bridge tak terjangkau / error auth)
-   + hook 10 detik yang memantau folder antrean dan langsung membangunkan worker
-   begitu ada job baru. Worker pakai WORKER_KEY (role=worker).
+4. Pasang worker di VM Muse (bukan di VPS ini). Worker = `deploy/muse-worker.sh`
+   yang dipasang oleh `deploy/muse-setup.sh`; ia poll `/muse/pending`, relay
+   `request` ke Muse lokal VM, lalu `POST /muse/answer` (diam kecuali bridge
+   tak terjangkau / error auth / Muse lokal error). Worker pakai WORKER_KEY
+   (role=worker) dari langkah 1.
+   a. Ekspos bridge ke VM: karena `bridge.py` bind 127.0.0.1, buat tunnel
+      (mis. cloudflared quick tunnel) ke port 8765 dan catat BRIDGE_URL
+      publiknya (mis. https://xxx.trycloudflare.com).
+   b. Di dalam VM Muse, jalankan sekali:
+        BRIDGE_URL=https://xxx.trycloudflare.com \
+        BRIDGE_WORKER_KEY=<WORKER_KEY> \
+        MUSE_BASE_URL=http://127.0.0.1:8080/v1 MUSE_MODEL=<model-lokal> \
+        bash deploy/muse-setup.sh
+   c. Nyalakan + daftarkan auto-start:
+        muse-worker once     # tes satu putaran
+        muse-worker up       # background (respawn loop)
+        muse-worker status   # cek jalan + config ringkas
+      lalu daftarkan ~/pdata/bin/muse-worker-boot.sh di Muse Scheduled Task.
+   (Detail VM ada di header deploy/muse-setup.sh.)
 
 5. Pairing + allowlist (WAJIB sebelum bridge WhatsApp bisa membalas):
    - Pair nomor (cetak kode 8 karakter, lalu Perangkat Tertaut di HP):
